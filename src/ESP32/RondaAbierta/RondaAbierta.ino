@@ -293,7 +293,13 @@ float distL_filtrada = SIN_PARED_CM, distR_filtrada = SIN_PARED_CM, distF_filtra
 // Carrera
 int  turnsCompleted     = 0;
 // Mapeo Open (vuelta 1): pasillos 60|100 cm entre laterales válidos (< umbralPared).
-const float MAP_SPAN_CM = 7.0f;   // ~ancho entre caras laterales de los VL53
+const bool MAP_PROFILE_ENABLE = false;  // Opt-in para comparar en el gemelo y en pista.
+const int MAP_FRONT_WIDE_CM = 80;       // Antes: 90 cm. Solo pasillo medido de 100 cm.
+const int MAP_PWM_NARROW = 220;          // Techo en recta angosta, sujeto al freno reactivo.
+const int MAP_MIN_SAMPLES = 3;
+bool mapReady = false;
+int mapUseTurn = -1;
+const float MAP_SPAN_CM = 7.04f;   // ~ancho entre caras laterales de los VL53
 float mapSumLR = 0.0f;
 int   mapSamples = 0;
 int   mapPasilloCm[4] = {0, 0, 0, 0};
@@ -657,32 +663,64 @@ void pidRumbo() {
 // Una línea por recta: si "hold" sale bajo, el PID de pared casi no actuó.
 // "int sin dato" alto = el ToF interior no ve la pared.
 void mapReiniciar() {
+  mapReady = false;
+  mapUseTurn = -1;
   mapSumLR = 0.0f;
   mapSamples = 0;
   for (int i = 0; i < 4; i++) mapPasilloCm[i] = 0;
 }
 
 void mapMuestra(long distL, long distR) {
+  if (turnsCompleted >= 4) return;
+  const float errorDeg = anguloGyro - rumboRecta(turnsCompleted);
+  if (fabsf(errorDeg) > 15.0f) return;
   if (distL <= 0 || distR <= 0 || distL >= umbralPared || distR >= umbralPared) return;
-  mapSumLR += (float)(distL + distR);
+  const float ancho = (distL + distR + MAP_SPAN_CM) * cosf(errorDeg * (PI / 180.0f));
+  if ((ancho < 50.0f || ancho > 70.0f) && (ancho < 90.0f || ancho > 110.0f)) return;
+  mapSumLR += ancho;
   mapSamples++;
 }
 
 void mapCongelarSeccion(int secIndex) {
   if (secIndex < 0 || secIndex >= 4) return;
-  float corridor = (mapSamples > 0) ? (mapSumLR / (float)mapSamples) + MAP_SPAN_CM : 0.0f;
-  int pasillo = (corridor < 80.0f) ? 60 : 100;
+  int pasillo = 0;
+  if (mapSamples >= MAP_MIN_SAMPLES) {
+    const float corridor = mapSumLR / mapSamples;
+    if (corridor >= 50.0f && corridor <= 70.0f) pasillo = 60;
+    if (corridor >= 90.0f && corridor <= 110.0f) pasillo = 100;
+  }
   mapPasilloCm[secIndex] = pasillo;
-  Log.printf("MAP sec=%d pasillo=%d cm\n", secIndex + 1, pasillo);
+  if (pasillo) Log.printf("MAP sec=%d pasillo=%d cm\n", secIndex + 1, pasillo);
+  else Log.printf("MAP sec=%d sin estimación (%d muestras)\n", secIndex + 1, mapSamples);
   mapSumLR = 0.0f;
   mapSamples = 0;
 }
 
 void mapListoSiCompleto() {
-  if (mapPasilloCm[0] == 0 || mapPasilloCm[1] == 0 || mapPasilloCm[2] == 0 || mapPasilloCm[3] == 0)
-    return;
+  mapReady = mapPasilloCm[0] != 0 && mapPasilloCm[1] != 0 && mapPasilloCm[2] != 0 && mapPasilloCm[3] != 0;
+  if (!mapReady) return;
   Log.printf("MAP listo: %d/%d/%d/%d\n",
              mapPasilloCm[0], mapPasilloCm[1], mapPasilloCm[2], mapPasilloCm[3]);
+}
+
+int pwmRecta(long distF) {
+  int pwm = turnsCompleted == 0 ? VEL_INICIAL : MOTOR_MAX;
+  int slowdownCm = FRONT_SLOWDOWN_CM;
+  if (MAP_PROFILE_ENABLE && mapReady && turnsCompleted >= 4 && turnsCompleted < TURNS_PER_RACE) {
+    const int sec = turnsCompleted % 4;
+    const int ancho = mapPasilloCm[sec];
+    if (ancho == 60) pwm = min(pwm, MAP_PWM_NARROW);
+    if (ancho == 100) slowdownCm = MAP_FRONT_WIDE_CM;
+    if (mapUseTurn != turnsCompleted) {
+      mapUseTurn = turnsCompleted;
+      Log.printf("MAP usa vuelta=%d sec=%d pasillo=%d cm pwm=%d freno=%d cm\n",
+                 turnsCompleted / 4 + 1, sec + 1, ancho, pwm, slowdownCm);
+    }
+  }
+  if (distF > 0 && distF < slowdownCm) pwm = min(pwm, VEL_APROX_CERRADA);
+  if (turnsCompleted == 0 && distF > 0 && distF < FRONT_SLOWDOWN2_CM)
+    pwm = min(pwm, VEL_APROX2);
+  return pwm;
 }
 
 void imprimirResumenRecta() {
@@ -723,11 +761,7 @@ void arrancarCarrera() {
 
 void siguiendo(long distL, long distR, long distF) {
   mapMuestra(distL, distR);
-  velocidadMotor = (turnsCompleted == 0) ? VEL_INICIAL : MOTOR_MAX;
-  if (distF > 0 && distF < FRONT_SLOWDOWN_CM)
-    velocidadMotor = min(velocidadMotor, VEL_APROX_CERRADA);
-  if (turnsCompleted == 0 && distF > 0 && distF < FRONT_SLOWDOWN2_CM)
-    velocidadMotor = min(velocidadMotor, VEL_APROX2);
+  velocidadMotor = pwmRecta(distF);
 
   actualizarDesvio(distL_filtrada, distR_filtrada);
   setMotor(velocidadMotor);

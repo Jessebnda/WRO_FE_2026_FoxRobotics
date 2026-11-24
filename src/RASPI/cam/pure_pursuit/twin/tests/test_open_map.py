@@ -169,3 +169,25 @@ def test_reset_and_geometry_summary():
     assert g["drive_dir"] == "R"
     assert "sections" in g and g["sections"]["S"]["along_mm"] > 0
     assert "narrow_mask" in g
+
+def test_missing_straights_never_mark_geometry_ready():
+    wm = OpenWallMap(start_section="W")
+    wm.on_corner_complete(1)
+    assert wm.current_section == "S"
+    wm.on_corner_complete(1)
+    assert wm.current_section == "S"
+    wm.on_corner_complete(2)
+    wm.on_corner_complete(3)
+    wm.on_corner_complete(4)
+    assert not wm.ready and not wm.frozen
+
+
+def test_east_outer_wall_is_vertical():
+    assert expected_tof_mm((1100.0, 0.0, 270.0), "L", None) == pytest.approx(364.8)
+
+
+def test_straight_distance_uses_deltas_of_absolute_odometer():
+    wm = OpenWallMap()
+    for i in range(3):
+        wm.update_straight(50 * i, (0.0, -1000.0, 0.0), 460.0, 460.0, None, 3100 + 10 * i)
+    assert wm.geometry()["sections"]["S"]["along_mm"] == pytest.approx(20.0)

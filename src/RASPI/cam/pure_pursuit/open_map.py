@@ -25,8 +25,8 @@ Coordenadas: frame campo como ``track_map.FieldPose`` (origen centro, +x este,
 +y norte). ``inner_box_mm`` usa convención ``analiza_vuelta.INTERIOR``
 (x0,y0,x1,y1) con origen esquina exterior suroeste del tapete (0…3000 mm).
 
-Integración futura: lap 1 alimenta ``OpenWallMap`` desde ACK/odom; laps 2–3
-consumen ``inner_box_mm`` / ``inner_half_mm`` en el planificador (stubs en PP).
+El observador del gemelo de RondaAbierta registra ``geometry()`` tras el
+cuarto giro. El firmware usa su propio mapa de pasillos para el perfil.
 """
 
 from __future__ import annotations
@@ -236,12 +236,12 @@ class OpenWallMap:
 
     @property
     def frozen(self) -> bool:
-        return all(st.frozen for st in self._sections.values())
+        return self._turn_index == 4 and all(st.corridor_mm is not None for st in self._sections.values())
 
     @property
     def ready(self) -> bool:
         """True con 3 esquinas: tres pasillos medidos y ajustados (sin copiar el 4.º)."""
-        n_frozen = sum(1 for st in self._sections.values() if st.frozen and not st.inferred)
+        n_frozen = sum(1 for st in self._sections.values() if st.frozen and st.corridor_mm is not None and not st.inferred)
         return n_frozen >= 3
 
     def _snap_section(self, st: _SectionState) -> None:
@@ -275,8 +275,6 @@ class OpenWallMap:
 
         if self._last_odom_mm is not None:
             st.along_mm += max(0.0, odom_mm - self._last_odom_mm)
-        elif odom_mm > 0:
-            st.along_mm += float(odom_mm)
         self._last_odom_mm = odom_mm
 
         inner_key, outer_key = _inner_outer_keys(yaw, self._geom, self._current)
@@ -316,6 +314,8 @@ class OpenWallMap:
 
     def on_corner_complete(self, turn_index: int) -> None:
         """Finaliza la recta actual y avanza a la siguiente sección."""
+        if self._turn_index == 4 or turn_index != self._turn_index + 1:
+            return
         self._turn_index = turn_index
         st = self._sections[self._current]
         if not st.frozen:
@@ -333,8 +333,8 @@ class OpenWallMap:
 
         # avanzar sección según orden de marcha
         idx = self._order.index(self._current)
-        if idx + 1 < len(self._order):
-            self._current = self._order[idx + 1]
+        if turn_index < 4:
+            self._current = self._order[(idx + 1) % len(self._order)]
         self._last_odom_mm = None
         if turn_index >= 4:
             self._refine_inferred()
@@ -453,7 +453,7 @@ def _inner_outer_segments(
     """Segmentos para raycast: outer e inner rects en coords centro."""
     oh = outer_half
     outer = [
-        (oh, -oh, -oh, oh),
+        (oh, -oh, oh, oh),
         (-oh, oh, oh, oh),
         (-oh, oh, -oh, -oh),
         (-oh, -oh, oh, -oh),
