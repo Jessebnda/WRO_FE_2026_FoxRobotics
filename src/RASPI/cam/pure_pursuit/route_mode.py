@@ -1508,7 +1508,23 @@ class RouteMode:
             f = np.clip((di - isl_near) / max(isl_mm - isl_near, 1.0), 0.0, 1.0)
             v_isl = v_min + (v_base - v_min) * f
             v_c = np.where(di < isl_mm, np.minimum(v_c, v_isl), v_c)
-        allowed = np.sqrt(v_c ** 2 + 2.0 * a_brk * d)
+        # En rectas despejadas de V2-V3, calcula la distancia durante la
+        # latencia con la velocidad que realmente permite el sobre, no con
+        # el techo PWM (que puede quedar muy por encima de la velocidad real).
+        # Conserva el adelanto original si la huella invade la reserva lateral
+        # o queda una curva al alcance del seguidor.
+        adaptive = False
+        if l23 and self.fixed and conf and kmax[0] < 1.0 / 1600.0:
+            straight = dist <= float(C.ROUTE_LOOKAHEAD_MM)
+            if np.all(kmax[straight] < 1.0 / 1600.0):
+                wall, sign, island = self._offset_body(conf)
+                adaptive = min(wall, sign, island) >= 90.0
+        if adaptive:
+            reaction = a_brk * lat_s
+            allowed = np.maximum(v_c, np.sqrt(v_c ** 2 + 2.0 * a_brk * dist + reaction ** 2) - reaction)
+            d = np.maximum(dist - np.minimum(v_max, allowed) * lat_s, 0.0)
+        else:
+            allowed = np.sqrt(v_c ** 2 + 2.0 * a_brk * d)
         inside = np.nonzero(dist <= span)[0]
         k_min = inside[int(np.argmin(allowed[inside]))]
         v_allow = min(v_max, float(allowed[k_min]))
