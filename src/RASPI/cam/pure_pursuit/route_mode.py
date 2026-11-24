@@ -1236,7 +1236,7 @@ class RouteMode:
             # recta de parking debe estar confirmado; uno anterior sin resolver
             # impide armar la maniobra.
             green_entry = False
-            if dm.direction == "CW" and -250 <= self.pka <= 0 and getattr(self, "_tc_max", 0) >= 11:
+            if dm.direction == "CW" and -250 <= self.pka <= 0 and getattr(self, "_tc_max", 0) >= 12 and est in ("S", "C", "R"):
                 sec = RR._sec(dm.parking, dm.direction)
                 seats = sorted((sec.frame(*section_to_world(dm.parking, *SEATS[seat]))[0], seat)
                                for seat in SEATS if seat not in PARKING_FORBIDDEN_SEATS)

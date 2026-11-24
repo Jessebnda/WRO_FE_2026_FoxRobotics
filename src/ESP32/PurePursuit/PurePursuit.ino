@@ -3401,7 +3401,8 @@ void vigilarSinU() {
     Serial.print(" h="); Serial.println(parkDetHSon, 0);
     return;
   }
-  if (!sinUActivo() && parkSinUDec == 2) return;
+  const bool verdeRescate = rutaParkVerde && parkUturnPendiente && parkSinUDec == 2;
+  if (!sinUActivo() && parkSinUDec == 2 && !verdeRescate) return;
   if (PARK_MODO == PARK_NINGUNO || !PARK_SIN_U) return;
   if (!(piRuta && rutaTfOk && rutaSecSalida >= 0 && PARK_UTURN_RUTA_ALONG_MM > 0)) return;
   float x, y;
@@ -3414,7 +3415,7 @@ void vigilarSinU() {
   // Con un cajón temprano aún hay recta para alinear y pasar su primera
   // madera antes de invertir. El rojo y la entrada sin confirmar conservan
   // la decisión normal de escaneo o U.
-  if (rutaParkVerde && along <= rutaPka + 80.0f) {
+  if (verdeRescate && along <= rutaPka + 80.0f) {
     if (!parkUturnPendiente || turnsCompleted < TURNS_PER_RACE || along < -430.0f) return;
     const float h = parkHPoseMm(), error = rutaErrCarrilDeg();
     if (h >= 280.0f && h <= 435.0f && fabsf(error) <= 18.0f && distF_filtrada > 32.0f) {
@@ -3433,6 +3434,7 @@ void vigilarSinU() {
     return;
   }
 #endif
+  if (verdeRescate) return;  // la U sigue pendiente si la ventana de rescate venció
   const float extCm = rutaExtTapeteCm();
   const float rumboDeg = rutaErrCarrilDeg();
   if (!isnan(rutaPka) && rutaPka < (float)PARK_SINU_PKA_MIN_MM && parkSinUDec == 0) {
