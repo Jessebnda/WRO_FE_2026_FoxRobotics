@@ -282,6 +282,10 @@ float piWheelDeg  = 0.0f;    // pw=: rueda de la Pi con la ruta nueva (+ = derec
 bool  rutaTfOk    = false;
 float rutaTx = 0.0f, rutaTy = 0.0f, rutaTh = 0.0f;
 int   rutaSecSalida = -1;    // sección del tapete de la pose de salida (odometría 0,0); -1 = sin transformación aún
+bool rutaParkVerde = false;
+#if FOX_TOF
+float parkVerdeUltHit = NAN;
+#endif
 float rutaPka       = NAN;   // pka= : along (alongSalidaMm) de la madera del cajón más adelante en la carrera; NAN = sin dato
 const float RUTA_LOOKAHEAD_MM   = 200.0f;
 const float RUTA_LOOKAHEAD_L1_MM = 0.0f;   // opt-in: seguir la curva de vuelta 1 más cerca, sin tocar INICIO ni parking
@@ -3405,6 +3409,30 @@ void vigilarSinU() {
   float along = alongSalidaMm();
   bool pre = (turnsCompleted == TURNS_PER_RACE - 1) && seccionTapete(x, y) == rutaSecSalida && along >= (float)PARK_SINU_PRE_MM;
   if (!(parkUturnPendiente || pre)) return;
+#if FOX_TOF
+  // Deja que la ruta termine el paso exterior por la señal de entrada.
+  // Con un cajón temprano aún hay recta para alinear y pasar su primera
+  // madera antes de invertir. El rojo y la entrada sin confirmar conservan
+  // la decisión normal de escaneo o U.
+  if (rutaParkVerde && along <= rutaPka + 80.0f) {
+    if (!parkUturnPendiente || turnsCompleted < TURNS_PER_RACE || along < -430.0f) return;
+    const float h = parkHPoseMm(), error = rutaErrCarrilDeg();
+    if (h >= 280.0f && h <= 435.0f && fabsf(error) <= 18.0f && distF_filtrada > 32.0f) {
+      parkUturnPendiente = false;
+      parkUturnDisparoOdom = -1;
+      parkDirecto = true;
+      iniciarEstacionando();
+      parkRevGyroOff = anguloGyro - error;
+      anguloGyro = error;
+      parkRumboRef = 0.0f;
+      parkRevModo = false;
+      parkRevAnc = false;
+      parkFase = 44; parkFaseMs = millis(); parkOdom0 = odomMm;
+      Serial.println("PARK VERDE: acercada a pared");
+    }
+    return;
+  }
+#endif
   const float extCm = rutaExtTapeteCm();
   const float rumboDeg = rutaErrCarrilDeg();
   if (!isnan(rutaPka) && rutaPka < (float)PARK_SINU_PKA_MIN_MM && parkSinUDec == 0) {
@@ -4518,7 +4546,10 @@ void parsePiMessage(String &line) {   // por referencia: el único llamador (rea
       rutaTfOk = true;
       if (rutaSecSalida < 0) rutaSecSalida = seccionTapete(rutaTx, rutaTy);   // odometría (0,0) = pose de salida
     }
-    if (campoPi(line, ",pka=", v)) rutaPka = campoFloat(v);
+    if (campoPi(line, ",pka=", v)) {
+      rutaPka = campoFloat(v);
+      rutaParkVerde = campoPi(line, ",pvg=", v) && campoInt(v) == 1;
+    }
 
     piFirstV2Received  = true;   // desde aquí el carro ya puede rodar
     lastPiMsgMs = millis();
@@ -7739,6 +7770,84 @@ void loop() {
         }
         break;
       }
+
+#if FOX_TOF
+      // Acerca el eje a la banda de escaneo y vuelve paralelo antes de invertir.
+      if (parkFase == 44) {
+        const float h = parkHPoseMm();
+        if (alongSalidaMm() >= 1050.0f || distF_filtrada <= 23.0f
+            || millis() - parkFaseMs >= 3500) {
+          parkRevCaeAU("VERDE sin espacio para alinear");
+          break;
+        }
+        const float lateral = tofMm[parkParedEsIzquierda ? 0 : 1];
+        if (alongSalidaMm() >= rutaPka + 90.0f && fabsf(parkThCarril()) <= 4.0f
+            && h >= 285.0f && h <= 360.0f
+            && lateral >= 235.0f && lateral <= 335.0f) {
+          motorCoast();
+          parkFase = 45; parkFaseMs = millis();
+          parkDetHSon = lateral + 35.2f;
+          parkDetHPose = h;
+          parkRevBase = NAN; parkRevDrop = 0;
+          break;
+        }
+        motorAdelante();
+        const float hacia = constrain((h - 330.0f) * 0.20f, -10.0f, 12.0f);
+        servoRumboPark(haciaPared * hacia);
+        setMotor(PARK_REV_AVANCE_PWM);
+        break;
+      }
+      if (parkFase == 45) {
+        motorCoast();
+        escribirServo(centroServo);
+        if (millis() - parkFaseMs >= 220 && fabsf(encVelMmS) < 40.0f) {
+          parkFase = 46; parkFaseMs = millis();
+          Serial.println("PARK VERDE: reversa buscando madera con ToF");
+        } else if (millis() - parkFaseMs >= 1000) {
+          parkRevCaeAU("VERDE no se detuvo");
+        }
+        break;
+      }
+      if (parkFase == 46) {
+        const float along = alongSalidaMm(), yaw = parkThCarril() * DEG_TO_RAD;
+        const float lateral = tofMm[parkParedEsIzquierda ? 0 : 1];
+        const float hit = along + 110.6f * cosf(yaw) + (35.2f + lateral) * sinf(yaw);
+        const bool madera = lateral >= 35.0f && lateral <= 185.0f
+                         && fabsf(hit - (rutaPka - 10.0f)) <= 85.0f;
+        if (madera) {
+          if (!parkRevDrop) {
+            parkRevBase = hit;
+            parkRevDrop = 1;
+          }
+          parkVerdeUltHit = hit;
+        } else if (lateral > 220.0f && parkRevDrop) {
+          if (parkRevBase - parkVerdeUltHit >= 8.0f) {
+            const float w = 274.0f + along - 0.5f * (parkVerdeUltHit + parkRevBase);
+            parkDetHSon += parkHPoseMm() - parkDetHPose;
+            parkDetHPose = parkHPoseMm();
+            parkDetAlong = along - (w - PARK_PL_W_DET) - PARK_PL_CONO * (parkDetHSon - 350.0f);
+            parkDetTh = 0.0f;
+            parkRevAnc = true;
+            motorCoast();
+            parkFase = 41; parkFaseMs = millis(); parkOdom0 = odomMm;
+            Serial.println("PARK VERDE: madera ToF, entra al plan normal");
+            break;
+          }
+          parkRevDrop = 0;
+        }
+        if (along < rutaPka - 190.0f || millis() - parkFaseMs >= 3200
+            || fabsf(yaw) > 10.0f * DEG_TO_RAD
+            || (parkRevDrop && parkRevBase - hit > 100.0f)
+            || (tofMm[2] > 0 && tofMm[2] < 95)) {
+          parkRevCaeAU("VERDE sin ancla ToF");
+          break;
+        }
+        motorReversa();
+        escribirServo(centroServo);
+        setMotor(PARK_REV_BUSCA_PWM);
+        break;
+      }
+#endif
 
       // ── Fase 41: pasa el cajon recto por el carril hasta w = PARK_REV_W_MM y de ahi al plan de reversa ──
       if (parkFase == 41) {

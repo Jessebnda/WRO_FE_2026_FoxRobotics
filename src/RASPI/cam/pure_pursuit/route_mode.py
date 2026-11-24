@@ -1232,6 +1232,22 @@ class RouteMode:
         if self.fixed and self.park_w is not None:
             park_w = self.park_w if self._park_refined_w is None else self._park_refined_w
             self.pka = _stall_far_along(dm.parking, dm.direction, park_w)
+            # CW pasa el verde por fuera. El primer asiento ocupado de la
+            # recta de parking debe estar confirmado; uno anterior sin resolver
+            # impide armar la maniobra.
+            green_entry = False
+            if dm.direction == "CW" and -250 <= self.pka <= 0 and getattr(self, "_tc_max", 0) >= 11:
+                sec = RR._sec(dm.parking, dm.direction)
+                seats = sorted((sec.frame(*section_to_world(dm.parking, *SEATS[seat]))[0], seat)
+                               for seat in SEATS if seat not in PARKING_FORBIDDEN_SEATS)
+                for along, seat in seats:
+                    if along - OUTER_HALF_MM >= self.pka:
+                        break
+                    key = (dm.parking, seat)
+                    if key in conf or key not in empty:
+                        green_entry = conf.get(key) == "Green"
+                        break
+            self._park_green_entry = green_entry
         suffix = self._suffix() if getattr(C, "ROUTE_ON_ESP", False) else ""
         return obs, suffix, line
 
@@ -2283,6 +2299,8 @@ class RouteMode:
             s += f",ps=1,pw={self.pi_wheel:.2f}"
         if self.fixed and getattr(self, "pka", None) is not None:
             s += f",pka={self.pka:.0f}"
+            if getattr(self, "_park_green_entry", False):
+                s += ",pvg=1"
         if self.rv is not None:
             s += f",rv={_rv_mando(self.rv)}"
         return s
