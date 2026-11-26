@@ -1930,3 +1930,8 @@ LOC_L23_PAIR_TOL_MM = None  # opt-in: descarta lecturas ToF laterales opuestas q
 # N20: freno selectivo en curva de vuelta 1 junto a una señal. Opt-in.
 # selective: conservar el freno cerca del cajon o de la fila X al salir de curva; fuera rigen other_mm y other_pwm.
 ROUTE_L1_CORNER_SIGN = None   # {pwm, mm, radius_mm, unk_only}: tope en curvas cerradas cerca de señales (unk_only: solo asientos sin resolver)
+
+# Experimento de vuelta 1. Cada comportamiento se habilita por separado.
+ROUTE_L1_DRAW_INFERENCE = False
+ROUTE_L1_PATH_BRAKE = False
+ROUTE_L1_LOCK_PASS_SIDE = False

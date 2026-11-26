@@ -35,6 +35,7 @@ import cv2
 import numpy as np
 
 from . import config as C
+from .l1r import possible_colors
 from . import ring_route as RR
 from .digital_map import feet_world
 from .motor_curve import forward_curve
@@ -134,6 +135,10 @@ def _prm_for(unknown, tc=0.0):
     """
     prm = _route_params()
     l1s = getattr(C, "ROUTE_L1_SOFT_CLEAR_MM", None)
+    if unknown and 1 <= float(tc or 0) < 4 and C.ROUTE_L1_PATH_BRAKE:
+        # La huella de los posibles postes sigue como restricción dura.
+        # Sin atracción a los asientos ambiguos, la DP gana holgura lateral.
+        prm.w_unknown_near = 0.0
     if unknown and l1s is not None and float(tc or 0) >= 1.0:
         prm.soft_clear_mm = float(l1s)   # vuelta 1 tras la salida: margen propio (en tc=0 rompe la salida: s3/s33/s45)
     if not unknown:
@@ -347,6 +352,7 @@ class RouteMode:
         self._job_out = None
         self._job_conf = {}
         self._job_unknown = []
+        self._l1_pass_sides = {}
         self._job_shift = 0.0
         self._delay_left = None      # frames que faltan para adoptar el plan retrasado (ROUTE_PLAN_DELAY_S)
         self.pi_steer = False        # ps=1: el ESP gira con el obs de la Pi (ruta nueva) mientras sube
@@ -914,6 +920,23 @@ class RouteMode:
                 prov.setdefault(k, rc)
         plan_seats = {**conf, **prov}
         plan_unknown = [k for k in unknown if k not in prov]
+        inferred = {}
+        draw_empty = set()
+        draw_fallback = None
+        route_l1 = self.fixed and 1 <= max(float(tc or 0), float(getattr(self, "_tc_max", 0) or 0)) < 4
+        if route_l1 and C.ROUTE_L1_DRAW_INFERENCE:
+            possibilities = possible_colors(dm.direction, dm.parking, conf, empty)
+            if possibilities is not None:
+                for seat in plan_unknown:
+                    colors = possibilities[seat]
+                    if len(colors) == 1:
+                        inferred[seat] = next(iter(colors))
+                    elif not colors:
+                        draw_empty.add(seat)
+                if inferred or draw_empty:
+                    draw_fallback = (dict(plan_seats), list(plan_unknown))
+                plan_seats.update(inferred)
+                plan_unknown = [k for k in plan_unknown if k not in inferred and k not in draw_empty]
         if getattr(C, "ROUTE_PROV_RULES", False) and prov:
             rule = self._rule_empty(plan_seats)
             plan_unknown = [k for k in plan_unknown if k not in rule]
@@ -1059,6 +1082,13 @@ class RouteMode:
                 # Sigue siendo obstáculo: se planea por el lado de la pared (rojo=derecha en CCW, verde=izquierda en CW).
                 lado = "Red" if dm.direction == "CCW" else "Green"
                 plan_seats = {k: (lado if k[0] == dm.parking and pk <= _al(k[1]) < pk + far_mm else v) for k, v in plan_seats.items()}
+        if C.ROUTE_L1_LOCK_PASS_SIDE and self.fixed:
+            lap_turn = max(float(tc or 0), float(tcf or 0))
+            if lap_turn < 4:
+                self._record_l1_passes(dm.direction, pose, conf)
+            elif lap_turn < 12:
+                plan_seats.update(self._l1_pass_sides)
+                plan_unknown = [k for k in plan_unknown if k not in self._l1_pass_sides]
         key = (dm.direction, dm.parking, self.park_w, self.shift,
                tuple(sorted(plan_seats.items())), tuple(sorted(plan_unknown)), extra_key, hug)
         if key != self.key and key != self._job_key:
@@ -1082,7 +1112,7 @@ class RouteMode:
                 lock = {(k0 + j) % nst: float(self.route.d_stations[(k0 + j) % nst]) for j in range(nl)}
                 anchor = None
             args = (dm.direction, plan_seats, dm.parking, plan_unknown, anchor, lock, self.park_w, extra, hug)
-            plan_kwargs = {"fb": self._ghost_fb, "tc": getattr(self, "_tc_max", 0)}
+            plan_kwargs = {"fb": self._ghost_fb, "tc": getattr(self, "_tc_max", 0), "draw_fallback": draw_fallback}
             hold = anchor_replan and self.route is not None
             if getattr(C, "ROUTE_PLAN_ASYNC", False):
                 # Carro real: la DP tarda ~1-2 s en la Pi; corre aparte y el
@@ -1134,6 +1164,12 @@ class RouteMode:
         if self.fixed:
             # Los asientos con color por ROI ya tienen lado: no frenan (ni cuentan para la parada).
             speed_unknown = [k for k in unknown if k not in roi_seats and k not in half_seats]
+            path_brake = (route_l1 and C.ROUTE_L1_PATH_BRAKE and self.esp_route is self.route
+                          and not self.upload and self._rte_n is None and self.key == key
+                          and self.route.report.get("feasible"))
+            if path_brake:
+                path_risks = set(self._l1_path_risks(unknown, draw_empty))
+                speed_unknown = [k for k in speed_unknown if k in path_risks]
             # Después de la vuelta 1 (tc >= ROUTE_UNSEEN_MAX_TC) lo que falta no frena: la ruta ya lo
             # esquiva como obstáculo (orillas48: N/T3 sin confirmar hasta la vuelta 3, PWM 130 en cada pasada).
             _max_tc = getattr(C, "ROUTE_UNSEEN_MAX_TC", None)
@@ -1224,6 +1260,8 @@ class RouteMode:
                        and not plan_unknown and self.key == key)
         corner_points = []
         for sec, seat in unknown:
+            if self.fixed and path_brake and (sec, seat) not in path_risks:
+                continue
             xy = section_to_world(sec, *SEATS[seat])
             seat_key = (sec, seat)
             if can_release and seat_key in prov and self._conf_prev.get(seat_key) == prov[seat_key]:
@@ -1237,7 +1275,8 @@ class RouteMode:
             corner_points.append(xy)
         self._unk_pts = np.asarray(corner_points, dtype=float).reshape(-1, 2)
         prof = self._profile_pwm(
-            self._sign_xy(conf, empty),
+            self._sign_xy(conf, empty | (set(unknown) - path_risks))
+            if self.fixed and path_brake else self._sign_xy(conf, empty),
             lap2=tc is not None and 4 <= tc < int(getattr(C, "ROUTE_LAP2_PROFILE_TC_MAX", 8)),
             l23=tc is not None and 4 <= tc < 12,
             l1=tc is not None and 1 <= tc < 4,
@@ -2369,8 +2408,13 @@ class RouteMode:
         self._job_out, self._job_conf, self._job_unknown = self._solve_plan(*args, **kwargs)
 
     @staticmethod
-    def _solve_plan(direction, conf, parking, unknown, anchor, lock, park_w, extra, hug, *, fb, tc):
-        for seats, unk in ((conf, unknown), fb) if fb is not None and getattr(C, "ROUTE_GHOST_FALLBACK", False) else ((conf, unknown),):
+    def _solve_plan(direction, conf, parking, unknown, anchor, lock, park_w, extra, hug, *, fb, tc, draw_fallback=None):
+        candidates = [(conf, unknown)]
+        if fb is not None and getattr(C, "ROUTE_GHOST_FALLBACK", False):
+            candidates.append(fb)
+        if draw_fallback is not None:
+            candidates.append(draw_fallback)
+        for seats, unk in candidates:
             route = RR.plan(direction, seats, parking, prm=_prm_for(unk, tc), unknown=unk, anchor=anchor,
                             lock=lock, park_w=park_w, extra=extra, hug=hug)
             if route.report.get("feasible"):
@@ -2403,7 +2447,15 @@ class RouteMode:
             self._up_route = route
         self.upload_shift = shift
         self.hold = hold
-        self.loc.set_map(conf, unknown, dm.parking, self.park_w)
+        tcf = getattr(self, "_tc_max", 0)
+        if self.fixed and ((C.ROUTE_L1_DRAW_INFERENCE and 1 <= tcf < 4)
+                           or (C.ROUTE_L1_LOCK_PASS_SIDE and 4 <= tcf < 12)):
+            # Las hipótesis dan lado a la DP; no son observaciones para asociar ToF.
+            observed, absent = self._resolved(dm)
+            uncertain = [k for k in self._all_seats() if k not in observed and k not in absent]
+            self.loc.set_map(observed, uncertain, dm.parking, self.park_w)
+        else:
+            self.loc.set_map(conf, unknown, dm.parking, self.park_w)
         rep = route.report
         print(f"[ROUTE] plan#{self.n_plans} {dm.direction} park={dm.parking}@{self.park_w:.0f}"
               f"{'' if self.fixed else ' (supuesto)'}{' ALTO' if hold else ''} conf={len(conf)} "
@@ -2412,6 +2464,36 @@ class RouteMode:
               f"isla={rep.get('island_mm', 0):.0f} Rmin={rep.get('r_min_mm', 0):.0f} "
               f"L={route.length_mm:.0f} {rep.get('solve_ms', 0):.0f}ms "
               f"señales=[{' '.join(f'{sc}/{sd}{str(col)[0]}' for (sc, sd), col in sorted(conf.items()))}]", flush=True)
+
+    def _record_l1_passes(self, direction, pose, confirmed):
+        """Fija solo lados confirmados y ya recorridos con margen para la cola."""
+        x, y, yaw = pose
+        for (section, seat), color in confirmed.items():
+            key = (section, seat)
+            if key in self._l1_pass_sides:
+                continue
+            sec = RR._sec(section, direction)
+            heading = math.degrees(math.atan2(sec.f[0], sec.f[1]))
+            if abs((yaw - heading + 180) % 360 - 180) > 30:
+                continue
+            along, lateral = sec.frame(x, y)
+            sign_along, sign_lateral = sec.frame(*section_to_world(section, *SEATS[seat]))
+            inside = (color == "Red") == (direction == "CW")
+            gap = sign_lateral - lateral if inside else lateral - sign_lateral
+            if 100 <= along - sign_along <= 330 and 0 <= lateral <= 1000 and gap >= 90:
+                self._l1_pass_sides[key] = color
+
+    def _l1_path_risks(self, unknown, absent):
+        """Asientos posibles cuya huella puede cortar el corredor de frenado."""
+        r = self.route
+        top_speed = float(C.ROUTE_PROFILE_K_MM_S_PER_PWM) * (C.ROUTE_PROFILE_MAX_PWM - C.ROUTE_PROFILE_PWM0)
+        distance = top_speed * C.ROUTE_PROFILE_LATENCY_S + top_speed ** 2 / (2 * C.ROUTE_PROFILE_A_BRAKE_MM_S2)
+        step = r.length_mm / len(r.x)
+        j = (max(self.follower.i, 0) + np.arange(int(distance / step) + 2)) % len(r.x)
+        heading = np.radians(r.heading_deg[j])
+        reserve = SIGN_MM / math.sqrt(2.0) + abs(self.follower.cte) + float(C.ROUTE_CORNER_EXIT_CLEAR_MM)
+        return [key for key in unknown if key not in absent and np.any(
+            RR._rect_dist_pose(*section_to_world(key[0], *SEATS[key[1]]), r.x[j], r.y[j], heading) <= reserve)]
 
     def _speed(self, unknown, pose) -> int | None:
         """PWM máximo según lo que falta por ver.
