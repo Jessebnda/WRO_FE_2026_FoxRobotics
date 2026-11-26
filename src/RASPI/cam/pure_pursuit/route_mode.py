@@ -135,10 +135,6 @@ def _prm_for(unknown, tc=0.0):
     """
     prm = _route_params()
     l1s = getattr(C, "ROUTE_L1_SOFT_CLEAR_MM", None)
-    if unknown and 1 <= float(tc or 0) < 4 and C.ROUTE_L1_PATH_BRAKE:
-        # La huella de los posibles postes sigue como restricción dura.
-        # Sin atracción a los asientos ambiguos, la DP gana holgura lateral.
-        prm.w_unknown_near = 0.0
     if unknown and l1s is not None and float(tc or 0) >= 1.0:
         prm.soft_clear_mm = float(l1s)   # vuelta 1 tras la salida: margen propio (en tc=0 rompe la salida: s3/s33/s45)
     if not unknown:
@@ -924,7 +920,9 @@ class RouteMode:
         draw_empty = set()
         draw_fallback = None
         route_l1 = self.fixed and 1 <= max(float(tc or 0), float(getattr(self, "_tc_max", 0) or 0)) < 4
-        if route_l1 and C.ROUTE_L1_DRAW_INFERENCE:
+        # Limita la propagación de una falsa confirmación cuando todavía se
+        # conoce poco del mapa. La salida y las primeras vistas conservan la DP base.
+        if route_l1 and C.ROUTE_L1_DRAW_INFERENCE and len({sec for sec, _ in conf}) >= 3:
             possibilities = possible_colors(dm.direction, dm.parking, conf, empty)
             if possibilities is not None:
                 for seat in plan_unknown:
@@ -1087,8 +1085,10 @@ class RouteMode:
             if lap_turn < 4:
                 self._record_l1_passes(dm.direction, pose, conf)
             elif lap_turn < 12:
-                plan_seats.update(self._l1_pass_sides)
-                plan_unknown = [k for k in plan_unknown if k not in self._l1_pass_sides]
+                recalled = {k: side for k, side in self._l1_pass_sides.items()
+                            if k not in conf and k not in empty}
+                plan_seats.update(recalled)
+                plan_unknown = [k for k in plan_unknown if k not in recalled]
         key = (dm.direction, dm.parking, self.park_w, self.shift,
                tuple(sorted(plan_seats.items())), tuple(sorted(plan_unknown)), extra_key, hug)
         if key != self.key and key != self._job_key:
@@ -1165,10 +1165,17 @@ class RouteMode:
             # Los asientos con color por ROI ya tienen lado: no frenan (ni cuentan para la parada).
             speed_unknown = [k for k in unknown if k not in roi_seats and k not in half_seats]
             path_brake = (route_l1 and C.ROUTE_L1_PATH_BRAKE and self.esp_route is self.route
+                          and abs(self.follower.cte) < 30.0
                           and not self.upload and self._rte_n is None and self.key == key
                           and self.route.report.get("feasible"))
             if path_brake:
-                path_risks = set(self._l1_path_risks(unknown, draw_empty))
+                # Una futura detección de color puede obligar a cambiar de
+                # lado. Solo soltamos el freno si el asiento es imposible o
+                # ya concuerda con el lado que lleva la ruta activa.
+                resolved_side = {k for k in unknown if k in plan_seats
+                                 and plan_seats[k] == self._conf_prev.get(k)}
+                path_risks = set(self._l1_path_risks(resolved_side, draw_empty))
+                path_risks.update(set(unknown) - resolved_side - draw_empty)
                 speed_unknown = [k for k in speed_unknown if k in path_risks]
             # Después de la vuelta 1 (tc >= ROUTE_UNSEEN_MAX_TC) lo que falta no frena: la ruta ya lo
             # esquiva como obstáculo (orillas48: N/T3 sin confirmar hasta la vuelta 3, PWM 130 en cada pasada).
@@ -2419,6 +2426,9 @@ class RouteMode:
                             lock=lock, park_w=park_w, extra=extra, hug=hug)
             if route.report.get("feasible"):
                 break   # con fantasmas infactible (dos filas de la misma columna pegadas): se planea sin ellos
+        if draw_fallback is not None and seats is not draw_fallback[0]:
+            _, unresolved = draw_fallback
+            route.report["draw_hypotheses"] = tuple(k for k in unresolved if k not in unk)
         return route, seats, unk
 
     def _adopt(self, route, key, conf, unknown, empty, dm, shift: float = 0.0, hold: bool = False) -> None:
@@ -2447,15 +2457,12 @@ class RouteMode:
             self._up_route = route
         self.upload_shift = shift
         self.hold = hold
-        tcf = getattr(self, "_tc_max", 0)
-        if self.fixed and ((C.ROUTE_L1_DRAW_INFERENCE and 1 <= tcf < 4)
-                           or (C.ROUTE_L1_LOCK_PASS_SIDE and 4 <= tcf < 12)):
-            # Las hipótesis dan lado a la DP; no son observaciones para asociar ToF.
-            observed, absent = self._resolved(dm)
-            uncertain = [k for k in self._all_seats() if k not in observed and k not in absent]
-            self.loc.set_map(observed, uncertain, dm.parking, self.park_w)
-        else:
-            self.loc.set_map(conf, unknown, dm.parking, self.park_w)
+        # La lista de la DP puede contener fantasmas de visión que ya usaba
+        # el localizador. Solo se separan las hipótesis nuevas del sorteo.
+        hypotheses = route.report.get("draw_hypotheses", ())
+        loc_conf = {k: v for k, v in conf.items() if k not in hypotheses}
+        loc_unknown = [*unknown, *hypotheses] if hypotheses else unknown
+        self.loc.set_map(loc_conf, loc_unknown, dm.parking, self.park_w)
         rep = route.report
         print(f"[ROUTE] plan#{self.n_plans} {dm.direction} park={dm.parking}@{self.park_w:.0f}"
               f"{'' if self.fixed else ' (supuesto)'}{' ALTO' if hold else ''} conf={len(conf)} "
